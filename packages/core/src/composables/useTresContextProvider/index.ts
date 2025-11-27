@@ -1,3 +1,4 @@
+import { Scene } from 'three'
 import type { MaybeRef, MaybeRefOrGetter, Ref, ShallowRef } from 'vue'
 
 import type { TresControl, TresScene } from '../../types'
@@ -26,38 +27,34 @@ export interface TresContext {
 export const INJECTION_KEY = 'useTres' // this is intentionally not a symbol as it can not properly be bridged to the custom renderer
 
 const [useTresContextProvider, _useTresContext] = createInjectionState(({
-  scene,
   canvas,
   windowSize,
   rendererOptions,
 }: {
-  scene: TresScene
   canvas: MaybeRef<HTMLCanvasElement>
   windowSize: MaybeRefOrGetter<boolean>
   rendererOptions: RendererOptions
 }): TresContext => {
-  const localScene = shallowRef(scene)
+  const scene = shallowRef<TresScene>(<TresScene> new Scene())
   const sizes = useSizes(windowSize, canvas)
 
   const camera = useCameraManager({ sizes })
 
-  const renderer = useRendererManager(
-    {
-      scene: localScene,
-      canvas,
-      options: rendererOptions,
-      contextParts: { sizes, camera },
-    },
-  )
+  const renderer = useRendererManager({
+    scene,
+    canvas,
+    options: rendererOptions,
+    contextParts: { sizes, camera },
+  })
 
   const events = useEventManager({
     canvas,
-    contextParts: { scene: localScene, camera, renderer },
+    contextParts: { scene, camera, renderer },
   })
 
   const ctx: TresContext = {
     sizes,
-    scene: localScene,
+    scene,
     camera,
     renderer,
     controls: ref(null),
@@ -72,7 +69,7 @@ const [useTresContextProvider, _useTresContext] = createInjectionState(({
 
   return ctx
 }, {
-  injectionKey: 'useTres',
+  injectionKey: INJECTION_KEY,
 })
 
 const useTresContext = () => {

@@ -8,5 +8,6 @@ export * from './useRenderer/useRendererManager'
 export * from './useTres'
 
 export { type TresContext, useTresContext, useTresContextProvider } from './useTresContextProvider'
+export { useTresContextRoot } from './useTresContextRoot'
 
 export { UseLoader }
