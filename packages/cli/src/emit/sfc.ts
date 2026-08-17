@@ -97,6 +97,69 @@ function isContainer(node: IRNode): boolean {
   return !node.geometry && !isPassthrough(node)
 }
 
+/** The `ready` payload and `emit` call, by whether the model carries clips. */
+const READY_PAYLOAD = {
+  animated: {
+    type: '{ nodes: ModelNodes, materials: ModelMaterials, actions: Record<ActionName, AnimationAction | undefined> }',
+    value: '{ nodes: nodes.value, materials: materials.value, actions }',
+  },
+  static: {
+    type: '{ nodes: ModelNodes, materials: ModelMaterials }',
+    value: '{ nodes: nodes.value, materials: materials.value }',
+  },
+} as const
+
+/**
+ * The `ready` declaration. Separate from the wiring below because it has to sit above
+ * `defineSlots`, which `vue/define-macros-order` enforces in the consumer's own lint run.
+ */
+function readyEmits(payload: { type: string, value: string }): string[] {
+  return [
+    'const emit = defineEmits<{',
+    `${INDENT}ready: [${payload.type}]`,
+    '}>()',
+    '',
+  ]
+}
+
+/**
+ * The `ready`/`isReady` pair. The event is one-shot per load, so a parent that binds late has
+ * nothing to read — `isReady` is the replayable half. Post-flush so it fires after the tree is
+ * in the graph, and back to `false` the moment any term stops holding, so it never lies after a
+ * refetch (`useGLTF` exposes `execute()`).
+ *
+ * `terms` are AND-ed into one boolean, which is what the watch reads: the callback then only
+ * runs when readiness actually flips, and each term names what it waits for instead of sitting
+ * at a position in an array the guard has to index.
+ */
+function readySetup(payload: { type: string, value: string }, terms: string[]): string[] {
+  // `&&` leads its line: `style/operator-linebreak`, the shape the consumer's linter wants.
+  const source = terms.length === 1
+    ? [`${INDENT}() => ${terms[0]},`]
+    : [
+        `${INDENT}() => ${terms[0]}`,
+        ...terms.slice(1).map((term, index) =>
+          `${INDENT.repeat(2)}&& ${term}${index === terms.length - 2 ? ',' : ''}`),
+      ]
+
+  return [
+    'const isReady = ref(false)',
+    'watch(',
+    ...source,
+    `${INDENT}(ready) => {`,
+    `${INDENT.repeat(2)}if (!ready) {`,
+    `${INDENT.repeat(3)}isReady.value = false`,
+    `${INDENT.repeat(3)}return`,
+    `${INDENT.repeat(2)}}`,
+    `${INDENT.repeat(2)}if (isReady.value) { return }`,
+    `${INDENT.repeat(2)}isReady.value = true`,
+    `${INDENT.repeat(2)}emit('ready', ${payload.value})`,
+    `${INDENT}},`,
+    `${INDENT}{ flush: 'post', immediate: true },`,
+    ')',
+  ]
+}
+
 export function emitSFC(ir: GLTFIR, options: EmitOptions): EmitResult {
   const {
     url,
@@ -455,9 +518,14 @@ export function emitSFC(ir: GLTFIR, options: EmitOptions): EmitResult {
   const threeTypes = instanced
     ? new Set([
         ...slotSpecs.flatMap(slot => slot.bindings.map(binding => binding.type)),
-        ...(hasAnimations ? ['AnimationClip'] : []),
+        ...(hasAnimations ? ['AnimationClip', 'AnimationAction'] : []),
       ].filter(type => THREE_CLASS.test(type)))
     : modelThreeTypes
+
+  // The `ready` payload types `actions` as `AnimationAction`, which `modelTypes` leaves out.
+  if (hasAnimations && !instanced) {
+    threeTypes.add('AnimationAction')
+  }
 
   const cientos = [
     instanced ? 'Instance' : '',
@@ -469,12 +537,21 @@ export function emitSFC(ir: GLTFIR, options: EmitOptions): EmitResult {
     // Instancing hands the clips over already wrapped, so only the standalone build computes them.
     ...(hasAnimations && !instanced ? ['computed'] : []),
     ...(instanced ? ['inject'] : []),
-    ...(hasAnimations ? ['ref'] : []),
+    // `ready`/`isReady` need both on every variant.
+    'ref',
+    'watch',
   ]
 
   // The provider declares the model's shapes, so this file imports them instead of
   // repeating them. Types only: the injection key itself is a literal in both files.
-  const provided = [...(hasAnimations ? ['ActionName'] : []), 'ModelContext']
+  // `ModelNodes` / `ModelMaterials` are named in the `ready` payload type. Sorted, because
+  // `perfectionist/sort-named-imports` reads the generated file as readily as a written one.
+  const provided = [
+    ...(hasAnimations ? ['ActionName'] : []),
+    'ModelContext',
+    'ModelMaterials',
+    'ModelNodes',
+  ]
 
   const imports = [
     threeTypes.size > 0 ? `import type { ${[...threeTypes].sort().join(', ')} } from 'three'` : '',
@@ -484,11 +561,10 @@ export function emitSFC(ir: GLTFIR, options: EmitOptions): EmitResult {
     vue.length > 0 ? `import { ${vue.join(', ')} } from 'vue'` : '',
   ].filter(Boolean)
 
-  const animationSetup = [
+  const animationBind = [
     `const modelRef = ref()`,
     `const { actions } = useAnimations<AnimationClip, ActionName>(animations, modelRef)`,
     '',
-    `defineExpose({ nodes, materials, actions })`,
   ]
 
   const setup = instanced
@@ -500,20 +576,51 @@ export function emitSFC(ir: GLTFIR, options: EmitOptions): EmitResult {
         '',
         `const { ${['nodes', 'materials', ...(hasAnimations ? ['animations'] : [])].join(', ')} } = context`,
         '',
-        ...(hasAnimations ? animationSetup : [`defineExpose({ nodes, materials })`]),
+        // No `isLoading` or `state` here — the provider owns the load — so ready follows the
+        // injected data: the actions binding when animated, the nodes populating when not.
+        ...(hasAnimations
+          ? [
+              ...animationBind,
+              ...readySetup(READY_PAYLOAD.animated, ['Object.keys(actions).length > 0']),
+              '',
+              `defineExpose({ nodes, materials, actions, isReady })`,
+            ]
+          : [
+              ...readySetup(READY_PAYLOAD.static, ['Object.keys(nodes.value).length > 0']),
+              '',
+              `defineExpose({ nodes, materials, isReady })`,
+            ]),
       ]
     : hasAnimations
       ? [
-          `const { ${[...(hasOwnClips ? ['state'] : []), 'nodes', 'materials', 'isLoading'].join(', ')} } = useGLTF<ModelNodes, ModelMaterials>(${loaderArgs})`,
-          ...clipLoads(sources),
+          `const { state, nodes, materials, isLoading } = useGLTF<ModelNodes, ModelMaterials>(${loaderArgs})`,
+          ...clipLoads(sources, { loading: true }),
           '',
           ...mergedClips(hasOwnClips, sources),
-          ...animationSetup,
+          ...animationBind,
+          // Every source has to land AND the actions bind: each clip file resolves on its own, so
+          // a handler firing on the first population would see the later clips undefined. `state`
+          // is the one that tells a finished load from a failed one — the actions bind against the
+          // root group, which stays mounted whatever the model did, so clips from a `--animations`
+          // file fill `actions` even when the model itself never arrived.
+          ...readySetup(READY_PAYLOAD.animated, [
+            '!isLoading.value',
+            ...sources.map(source => `!${source.loading}.value`),
+            'state.value !== null',
+            'Object.keys(actions).length > 0',
+          ]),
+          '',
+          `defineExpose({ nodes, materials, actions, isReady })`,
         ]
       : [
-          `const { nodes, materials, isLoading } = useGLTF<ModelNodes, ModelMaterials>(${loaderArgs})`,
+          `const { state, nodes, materials, isLoading } = useGLTF<ModelNodes, ModelMaterials>(${loaderArgs})`,
           '',
-          `defineExpose({ nodes, materials })`,
+          // `isLoading` is cleared in a `finally`, so a 404 clears it exactly like a success.
+          // `state` is set only when the load produced a scene, and nulled again on every
+          // refetch, so it is what keeps a failed load out of a `ready` handler.
+          ...readySetup(READY_PAYLOAD.static, ['!isLoading.value', 'state.value !== null']),
+          '',
+          `defineExpose({ nodes, materials, isReady })`,
         ]
 
   /**
@@ -577,6 +684,9 @@ export function emitSFC(ir: GLTFIR, options: EmitOptions): EmitResult {
     ...imports,
     '',
     ...(instanced ? [] : localTypes),
+    // Above `defineSlots`: `vue/define-macros-order` wants the macros in that order, and the
+    // payload type is declared (or imported) further up either way.
+    ...readyEmits(hasAnimations ? READY_PAYLOAD.animated : READY_PAYLOAD.static),
     ...slotTypes,
     ...setup,
     '</script>',
